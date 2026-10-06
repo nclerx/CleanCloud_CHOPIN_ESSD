@@ -340,22 +340,24 @@ def prepare_MIRAdata(filename, remove_noise=False, noise_method=None, stdev_thre
 
     if remove_noise:
         if noise_method == 'quantile':
+            # calculate noise background (10th percentile at each range gate) and set to NaN if considered as noise
+            noise_co = ds['sZco'].quantile(0.1, dim='doppler')
+            signal = ds['sZco'] > noise_co
             for var in vars:
-                # calculate noise background (10th percentile at each range gate) and set to NaN if considered as noise
-                noise_background = ds[var].quantile(0.1, dim=var_doppler)
-                ds[var] = ds[var].where(ds[var_co] > noise_background)
+                ds[var] = ds[var].where(signal)
+
         elif noise_method == 'hildebrandsekhon':
-            for nt in range(len(ds['time'])):
-                if nt >= ds['time'].shape[0]:
-                    continue
-                for var in vars:
-                    spectra = ds[var].isel(time=nt).values
-                    noise_background, stdev = estimate_noise(spectra)
-                    
-                    threshold = noise_background[:, None] + stdev_threshold * stdev[:, None]
-                    new_spectrum = np.where(spectra > threshold, spectra - threshold, 0)
-                    
-                    ds[var][nt, :, :] = new_spectrum
+            for var in ['sZco', 'sZcx']:
+                data = ds[var].values
+                out = np.empty_like(data)
+                for nt in range(data.shape[0]):
+                    spec = data[nt]
+                    noise, stdev = estimate_noise(spec)
+                    thr = noise[:, None] + stdev_threshold * stdev[:, None]
+                    out[nt] = np.where(spec > thr, spec - noise[:, None], np.nan)
+                ds[var] = ds[var].copy(data=out)
+
+        ds['sLDR'] = ds['sZcx'] / ds['sZco']
 
     ds = ds.sortby(var_doppler)
 
@@ -370,9 +372,10 @@ def prepare_MIRAdata(filename, remove_noise=False, noise_method=None, stdev_thre
     # convert from linear to dB values
     for var in vars:
         ds[var] = 10 * np.log10(ds[var].where(ds[var] > 0))
+    ds['sLDR'] = ds[var_co] - ds[var_cx]
+
     for var in ['Z', 'Zg', 'Zcx', 'LDRg']:
         ds[var] = 10 * np.log10(ds[var].where(ds[var] > 0))
-    ds['sLDR'] = 10 * np.log10(ds['sLDR'].where(ds['sLDR'] > 0))
 
     return ds
 
@@ -807,7 +810,7 @@ def calculate_spectralZ(ds):
     sZcx = (ds['SPCcx'] - ds['HSDcx']) * ds['RadarConst'] * ((ds.range/5000)**2) * ds['SNRCorFaCx'] / ds['npw2']
     sLDR = sZcx / sZco
 
-    return sZco, sZcx, sLDR
+    return sZco, sZcx, -sLDR
 
 
 def calculate_spectralZ_MXPol(ds):
@@ -1277,7 +1280,7 @@ def preprocess_BASTA(ds, variable='reflectivity', drop_variables=False):
     return ds
 
 
-def preprocess_MIRA(ds, drop_spectral=True, variable='Z'):
+def preprocess_MIRA(ds, drop_spectral=True, variable='Z', lin_to_dB=True, noise_method='hildebrandsekhon', stdev_threshold=2, n_fft=1, block_size=200):
     """filter/preprocess MIRA-data to remove noise & background mask"""
     if drop_spectral:
         ds = ds.max(dim='doppler', keep_attrs=True) # remove unnecessary dimensions but preserve metadata
@@ -1287,15 +1290,44 @@ def preprocess_MIRA(ds, drop_spectral=True, variable='Z'):
     ds = ds.assign(clean_mask=mask_xr)
     
     for var in ds.data_vars: # apply mask to all variables
-        if ds[var].dims == mask_xr.dims:
+        if var != 'clean_mask' and ds[var].dims == mask_xr.dims:
             ds[var] = ds[var].where(mask)
     
     for var in variables_MIRA_refl:
-        if var in ds.data_vars:
+        if var in ds.data_vars and lin_to_dB:
             ds[var] = 10 * np.log10(ds[var].where(ds[var] > 0))
 
+    if not drop_spectral:
+        ds['sZco'], ds['sZcx'], ds['sLDR'] = calculate_spectralZ(ds)
+        ds['doppler'] = -ds['doppler'].values # reverse axis to have correct doppler velocities
+
+        if noise_method == 'quantile':
+            # calculate noise background (10th percentile at each range gate) and set to NaN if considered as noise
+            noise_co = ds['sZco'].quantile(0.1, dim='doppler').drop_vars('quantile')
+            signal = ds['sZco'] > noise_co                
+            for var in ['sZco', 'sZcx']:
+                ds[var] = ds[var].where(signal)
+        elif noise_method == 'hildebrandsekhon':
+            for var in ['sZco', 'sZcx']:
+                da = ds[var].transpose('time', 'range', 'doppler')
+                spec = da.values
+                out = np.empty_like(spec)
+                for i in range(0, spec.shape[0], block_size):  # blocks of time steps, all spectra per block at once
+                    s = spec[i:i + block_size]
+                    noise, stdev = estimate_noise(s, n_fft=n_fft)
+                    noise = noise[..., None]
+                    thr = noise + stdev_threshold * stdev[..., None]
+                    out[i:i + block_size] = np.where(s > thr, s - noise, np.nan)
+                ds[var] = da.copy(data=out)
+
+        if noise_method:
+            ds['sLDR'] = ds['sZcx'] / ds['sZco'] 
+            
+        for var in ['sZco', 'sZcx', 'sLDR']:
+            ds[var] = 10*np.log10(ds[var].where(ds[var] > 0))
+
     return ds
-    
+   
 
 def preprocess_MXPol(ds, Zdr_corr=True, drop_spectral=True, SNR_thresh=-9999.):
     """
@@ -1755,15 +1787,6 @@ def load_zenithdata(date, dirs, DFRs, att_fn, BASTAmode, rolling_window='10min',
     full_time = pd.date_range(window_start, window_end, freq=target_freq) # start to end of available data resampled to every 5 seconds
     datasets = {}
 
-    def _trim(ds, name, start=pad_start, end=pad_end):
-        if ds is not None or 'time' not in ds.dims:
-            return ds
-        try:
-            return ds.sel(time=slice(start, end))
-        except Exception as e:
-            print(f"Could not trim {name} to window {start} - {end}: {e}")
-            return ds
-
     if useMXPol:
         # print(f'loading MXPol data for {year}-{month:02}-{day:02}')
         MXPol_filedir = os.path.join(dirs['MXPol'], f"{year}/{month:02}/{day:02}")
@@ -1799,7 +1822,9 @@ def load_zenithdata(date, dirs, DFRs, att_fn, BASTAmode, rolling_window='10min',
             # print(f'loading MIRA data for {year}-{month:02}-{day:02}')
             try:
                 # MIRA = xr.open_dataset(MIRA_files[0])
-                MIRA = preprocess_MIRA(xr.open_mfdataset(MIRA_files), drop_spectral=drop_spectral)
+                MIRA = xr.open_mfdataset(MIRA_files).sel(time=slice(pad_start, pad_end))
+                MIRA = preprocess_MIRA(MIRA, drop_spectral=drop_spectral)
+                # MIRA = preprocess_MIRA(xr.open_mfdataset(MIRA_files), drop_spectral=drop_spectral)
                 if resample_time and check_resampling(MIRA, 'time', target_coords=full_time, tolerance='2.5s'):
                     MIRA = safe_reindex(MIRA, 'time', full_time, tolerance='2.5s', name='MIRA', method=interp_method)
                 if resample_range and check_resampling(MIRA, 'range', target_coords=common_range, tolerance=common_range_spacing):
@@ -1825,7 +1850,7 @@ def load_zenithdata(date, dirs, DFRs, att_fn, BASTAmode, rolling_window='10min',
         if BASTA_files:
             # print(f'loading BASTA data for {year}-{month:02}-{day:02}')
             try:
-                BASTA = preprocess_BASTA(xr.open_mfdataset(BASTA_files, combine='by_coords'), drop_variables=False)
+                BASTA = preprocess_BASTA(xr.open_mfdataset(BASTA_files, combine='by_coords').sel(time=slice(pad_start, pad_end)), drop_variables=False)
                 if BASTA is not None:
                     if resample_time and check_resampling(BASTA, 'time', target_coords=full_time, tolerance='1.5s'):
                         BASTA = safe_reindex(BASTA, 'time', full_time, tolerance='1.5s', method=interp_method, name='BASTA')
