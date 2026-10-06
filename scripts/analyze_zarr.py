@@ -14,10 +14,10 @@ if project_path not in sys.path:
     sys.path.insert(0, project_path)
 
 from src import os, glob, np, pd, xr, plt, sns, datetime, mcolors, LogNorm, mdates, time, scipy, timedelta
-from src.constants_input import base_dir, dirs, zarr_variables, df_precip, pltConfig, plotdates_weekly, start_date, end_date, DFR_fn, date_ticks, radars, BASTAmodes, radar_ranges, calibrationvalues
+from src.constants_input import base_dir, dirs, zarr_variables, df_precip, pltConfig, plotdates_weekly, start_date, end_date, DFR_fn, date_ticks, radars, BASTAmodes, radar_ranges, calibrationvalues, frequencies, att_fn
 from src.plotting import plot_density_histogram, plot_density, FuncFormatter, meters_to_km, meters_to_km_num, weekly_plot, plot_weekly_HALO, weekly_plot_paper, weekly_plot_paper_ext, paper_plots
-from src.zarr_utils import generate_zarr_encodings, decode_and_combine_radars, decode_and_combine_modes, update_resampled_zarr
-from src.radar_processing import DFRcorrection_array as add_DFRcorrection
+from src.zarr_utils import generate_zarr_encodings, decode_and_combine_radars, decode_and_combine_modes, update_resampled_zarr, safe_reindex_dim
+from src.radar_processing import DFRcorrection_array as add_DFRcorrection, add_DFRcorrection_xr
 from src.radar_processing import cloudtop_height, find_continuous_cloudtop
 from src.utils import determine_nbins, read_ERA_data, get_DFRdata, mask_to_intervals, format_elapsed
 from matplotlib.ticker import MultipleLocator
@@ -38,12 +38,9 @@ zarrdir = f"{dirs['zarr']}/30s_25m"
 zarrdir_modes = f"{dirs['zarr']}/BASTAmodes_5s"
 zarrdir_modes_25m = f"{dirs['zarr']}/BASTAmodes_25m"
 zarrdir_native = f"{dirs['zarr']}/no_resampling"
-# zarrdir = f"{dirs['zarr']}/no_resampling_v2"
-# zarrdir = f"{dirs['zarr']}/no_resampling_wspectral"
-# os.makedirs(zarrdir, exist_ok=True)
+zarrdir_spectral = f"{dirs['zarr']}/no_resampling_wspectral"
 
-# DFRs = get_DFRdata(DFR_files) # outdated - now using the merged file in which MIRA reflectivities are corrected
-DFRs = pd.read_csv(DFR_fn, index_col=0)
+cloudtopDFRs = pd.read_csv(DFR_fn, index_col=0)
 
 # what = 'HALO_weekly_plots'
 # what = 'cloudtype_statistics'
@@ -796,73 +793,33 @@ def adjust_range(ds, mode):
 # %% loading data
 print('loading data from .zarr files')
 t0 = time.time()
+
 ds_combined, dsets = decode_and_combine_radars(zarrdir, radars[:-1])
 dsets_modes = decode_and_combine_modes(zarrdir_modes_25m, BASTAmodes)
 dsets_native = decode_and_combine_modes(zarrdir_native, BASTAmodes)
 
+mira_native = xr.open_zarr(f"{zarrdir_native}/MIRA.zarr", consolidated=True).unify_chunks()
+basta_native = xr.open_zarr(f"{zarrdir_native}/BASTA_25m.zarr", consolidated=True).unify_chunks()
+mxpol_native = xr.open_zarr(f"{zarrdir_native}/MXPol.zarr", consolidated=True).unify_chunks()
+
+mira_resampled = xr.open_zarr(f"{zarrdir}/MIRA.zarr", consolidated=True).unify_chunks()
+basta_resampled = xr.open_zarr(f"{zarrdir}/BASTA.zarr", consolidated=True).unify_chunks()
+mxpol_resampled = xr.open_zarr(f"{zarrdir}/MXPol.zarr", consolidated=True).unify_chunks()
+
+mira_spectral = xr.open_zarr(f"{zarrdir_spectral}/MIRA.zarr", consolidated=True).unify_chunks()
+mxpol_spectral = xr.open_zarr(f"{zarrdir_spectral}/MXPol.zarr", consolidated=True).unify_chunks()
+
 print(f"finished loading data ({time.time()-t0:.2f}s), starting calculations")
 t0 = time.time()
-# settings for 'find_continuous_cloudtop' from radar_processing-function "load_zenithdata"
-# ds_combined['cloudtop_max'] = cloudtop_height(ds_combined['Z_Ka'] > -35, n_consec=4)
-# ds_combined['cloudtop_new'] = find_continuous_cloudtop(ds_combined['Z_Ka'], ds_combined['cloudtop_max'])
-ds_combined = define_temperature_zones(ds_combined, lapse_rate=6.5)
-# ds_combined = classify_cloud_type(ds_combined, orographic_threshold=3000)
-ds_combined['DFRcorrection_W'] = add_DFRcorrection(DFRs, ds_combined.time.values)
-# for freq in ['X', 'Ka', 'W']:
-#     ds_combined = calculate_vertical_gradients(ds_combined, freq)
-ds_combined['0deg'] = ds_combined['height_rel_to_0C'].min(dim='range')
-ds_combined['precip'] = precip_from_zarr(ds_combined)
 
 dsets_tr = {}
 for mode in BASTAmodes:
     dsets_tr[mode] = xr.open_zarr(f"{os.path.dirname(zarrdir)}/BASTAmodes_5s_25m/BASTA_{mode}.zarr")
     dsets_tr[mode] = dsets_tr[mode].chunk({'time': 3600, 'range': -1})
 
-# re-calculate is_precip variable
-df_precip['start'] = pd.to_datetime(df_precip['start'])
-df_precip['end'] = pd.to_datetime(df_precip['end'])
-is_precip = xr.zeros_like(ds_combined['time'], dtype=bool)
-for _, row in df_precip.iterrows():
-    start, end = row['start'], row['end']
-    mask = (ds_combined['time'] >= np.datetime64(start)) & (
-        ds_combined['time'] <= np.datetime64(end))
-    is_precip = is_precip | mask
-ds_combined['is_precip'] = is_precip
-
 # load HALO data
 HALO_data_all = xr.open_mfdataset([f"{dirs['HALO']}/ABLclassification.nc", f"{dirs['HALO']}/epsilon.nc"], combine='by_coords')
 
-## commented out from below here
-# window_minutes = 10
-# # to be updated for non-resampled cases
-# window = int((window_minutes * 60) / 30)
-# fraction = 0.6
-
-# mask_oro = (ds_combined['cloudtop'] <= 2e3) & (ds_combined['cloudtop_max'] == ds_combined['cloudtop_new']) & (ds_combined['precip'])
-# max_Z = ds_combined['Z_Ka'].max(dim='range')
-# flag_oro_inst = mask_oro & (max_Z > 0)
-# ds_combined['orographic_inst'] = flag_oro_inst
-# flag_front_inst = (ds_combined['cloudtop'] >= 3e3) & (ds_combined['precip'])
-
-# oro_persist_count = flag_oro_inst.rolling(time=window, center=True).sum()
-# ds_combined['orographic'] = oro_persist_count >= (fraction * window)
-# # ds_combined['orographic'] = mask_oro & (max_Z > 5)
-
-# front_persist_count = flag_front_inst.rolling(time=window, center=True).sum()
-# ds_combined['frontal'] = front_persist_count >= (fraction * window)
-# # ds_combined['orographic'] = (ds_combined['cloudtop'] >= 4e3) & (ds_combined['precip'])
-
-# ds_combined['orographic_smoothed'], ds_combined['frontal_smoothed'], ds_combined['precip_ext'] = dominant_flag(
-#     ds_combined['orographic'],
-#     ds_combined['frontal'],
-#     ds_combined['precip'],
-#     window_minutes=120  # longer window
-# )
-
-# # adjust numpeaks for (set to nan where other variables are not present) & calculate actual peaktree # of peaks
-# ds_combined['numpeaks_Ka'] = ds_combined['numpeaks_Ka'].where(
-#     ds_combined['Z_Ka'] >= -60)
-# # ds_combined['numpeaks_Ka_PT'] = np.ceil(ds_combined['numpeaks_Ka_PT'].where(ds_combined['Z_Ka_PT'] >= -60)/2.)
 print(f"finished loading data from .zarr files ({time.time()-t0:.2f}s)\n")
 
 
@@ -1402,7 +1359,7 @@ if what == 'weekly_plots':
             f"Making plot for {start.strftime('%Y-%m-%d')} to {end.strftime('%Y-%m-%d')} at {pd.Timestamp.now().strftime('%Y-%m-%d %H:%M:%S')}")
         figpath = f"{base_dir}/summaryQLs/weeklyplots/{start.strftime('%Y%m%d')}-{end.strftime('%Y%m%d')}.png"
         weekly_plot(ds_combined, ERA_data, start, end, figpath)
-        # calculate DFRs
+
 
 # %%
 if what == 'HALO_weekly_plots':
@@ -1614,10 +1571,10 @@ if what == 'BASTA_masking':
     # print(f"elapsed time: {format_elapsed((pd.Timestamp.now() - t).total_seconds())}\n")
 
     # example plot
-    # date = datetime(2024, 11, 22)
-    # date = datetime(2025, 1, 12)
-    # mode = '25m'
-    # mode = '100m_18km'
+    date = datetime(2024, 11, 22)
+    date = datetime(2025, 1, 12)
+    mode = '25m'
+    mode = '100m_18km'
     dates = [datetime(2024, 11, 22), datetime(2025, 1, 12)]
     modes = ['25m', '100m_18km']
     for date in dates:
@@ -1679,19 +1636,17 @@ if what == 'BASTA_masking':
 #%% zarr corrections (run only once)
 """below code was run once to correct the zarr files (fill DFRs, add/remove variables to individual zarrs, etc.)"""
 if what == 'zarr_corrections':
+    # add BASTA cloudtop DFR correction + gas attenuation
+    # resample masks from native / 25m resolution BASTA to time-upscaled zarr
+    # compute X-Ka, Ka-W and X-W DFRs
+    # store output zarrs
+    
     import zarr
 
-    mira_native = xr.open_zarr(f"{zarrdir_native}/MIRA.zarr", consolidated=True).unify_chunks()
-    basta_native = xr.open_zarr(f"{zarrdir_native}/BASTA_25m.zarr", consolidated=True).unify_chunks()
-    mxpol_native = xr.open_zarr(f"{zarrdir_native}/MXPol.zarr", consolidated=True).unify_chunks()
+    flag_vars = ['background_mask', 'bg_30s', 'bg_120s', 'mask_artefacts_loose', 'mask_artefacts_strict']
+    exclude_vars = {'mask_artefacts_loose', 'mask_artefacts_strict', 'time_original', 'is_precip'}
 
-    mira_resampled = xr.open_zarr(f"{zarrdir}/MIRA.zarr", consolidated=True).unify_chunks()
-    basta_resampled = xr.open_zarr(f"{zarrdir}/BASTA.zarr", consolidated=True).unify_chunks()
-    mxpol_resampled = xr.open_zarr(f"{zarrdir}/MXPol.zarr", consolidated=True).unify_chunks()
-
-    flag_vars = ['is_precip', 'background_mask', 'bg_30s', 'bg_120s', 'mask_artefacts_loose', 'mask_artefacts_strict']
-    exclude_vars = {'mask_artefacts_loose', 'mask_artefacts_strict', 'time_original'}
-
+    # remove / update boolean vars
     mira_flag_vars = [v for v in flag_vars if v in mira_native.data_vars and v not in exclude_vars]
     basta_flag_vars = [v for v in flag_vars if v in basta_native.data_vars and v not in exclude_vars]
     mxpol_flag_vars = [v for v in flag_vars if v in mxpol_native.data_vars and v not in exclude_vars]
@@ -1701,14 +1656,16 @@ if what == 'zarr_corrections':
     mxpol_linearvars = [i for i in mxpol_native.data_vars if i not in flag_vars and i not in exclude_vars]
 
     # confirm each radar's daily step count before setting chunk sizes
-    for name, ds in [('MIRA', mira_resampled), ('BASTA', basta_resampled), ('MXPol', mxpol_resampled)]:
+    for name, ds in [#('MIRA', mira_resampled), 
+                     ('BASTA', basta_resampled), 
+                     ('MXPol', mxpol_resampled)]:
         one_day = ds.time.sel(time=slice(str(ds.time.values[0])[:10], None)).sel(
             time=slice(str(ds.time.values[0])[:10], (pd.Timestamp(ds.time.values[0]) + pd.Timedelta('1D'))))
         print(f"{name}: steps/day = {len(one_day)}")
 
     # build rechunked template + run update, per radar, into SEPARATE paths (not overwriting originals yet)
     for name, native_ds, resampled_ds, linvars, flagvars, time_chunk, out_suffix in [
-        ('MIRA', mira_native, mira_resampled, mira_linearvars, mira_flag_vars, 2880, '_rechunked'),
+        #('MIRA', mira_native, mira_resampled, mira_linearvars, mira_flag_vars, 2880, '_rechunked'),
         ('BASTA', basta_native, basta_resampled, basta_linearvars, basta_flag_vars, 2880, '_rechunked'),
         ('MXPol', mxpol_native, mxpol_resampled, mxpol_linearvars, mxpol_flag_vars, 2880, '_rechunked'),
     ]:
@@ -1727,15 +1684,59 @@ if what == 'zarr_corrections':
         )
         print(f"{name}: update complete, verify before swapping into {zarrdir}/{name}.zarr")
 
-    # for checking (to do)
-    mira_final = xr.open_zarr(f"{zarrdir}/MIRA_rechunked.zarr", consolidated=True)
-    frac_valid = float(mira_final['reflectivity'].notnull().mean())
-    print(f"MIRA full campaign non-NaN fraction: {frac_valid:.3f}")
+    # resampling 3s-resolution artefact masks to 30s_25m zarr file
+    source = xr.open_zarr(f"{zarrdir_native}/BASTA_25m.zarr", consolidated=True).unify_chunks()
+    mask_zarr_loose = safe_reindex_dim(source[['mask_artefacts_loose']], 'time', basta_resampled.time, '15s')
+    mask_zarr_loose = safe_reindex_dim(mask_zarr_loose, 'range', basta_resampled.range, 13)
+    mask_zarr_loose = (mask_zarr_loose == 1).compute()
+    mask_zarr_loose.drop_vars('range', errors='ignore').chunk({'time': 2880, 'range': -1})
+    mask_zarr_loose.to_zarr(f"{zarrdir}/BASTA.zarr", mode='a', compute=True)
+    mask_zarr_strict = safe_reindex_dim(source[['mask_artefacts_strict']], 'time', basta_resampled.time, '15s')
+    mask_zarr_strict = safe_reindex_dim(mask_zarr_strict, 'range', basta_resampled.range, 13)
+    mask_zarr_strict = (mask_zarr_strict == 1).compute()
+    mask_zarr_strict.drop_vars('range', errors='ignore').chunk({'time': 2880, 'range': -1})
+    mask_zarr_strict.to_zarr(f"{zarrdir}/BASTA.zarr", mode='a', compute=True)
+    zarr.consolidate_metadata(f"{zarrdir}/BASTA.zarr")
 
-    t_slice = slice('2025-01-15T15:00', '2025-01-15T16:30')
-    r_slice = slice(0, 5000)
-    print("native max:", float(mira_native['reflectivity'].sel(time=t_slice, range=r_slice).max()))
-    print("updated max:", float(mira_final['reflectivity'].sel(time=t_slice, range=r_slice).max()))
+    # include cloudtop DFR values in BASTA zarr
+    basta_native_cloudtopDFRs = add_DFRcorrection_xr(cloudtopDFRs, basta_native.time.values).rename('cloudtopDFRs')
+    basta_native_cloudtopDFRs.chunk('auto').to_zarr(f"{zarrdir_native}/BASTA_25m.zarr", mode='a', compute=True)
+    zarr.consolidate_metadata(f"{zarrdir_native}/BASTA_25m.zarr")
+
+    basta_resampled_cloudtopDFRs = add_DFRcorrection_xr(cloudtopDFRs, basta_resampled.time.values).rename('cloudtopDFRs')
+    basta_resampled_cloudtopDFRs.chunk({'time': 2880}).to_zarr(f"{zarrdir}/BASTA.zarr", mode='a', compute=True)
+    zarr.consolidate_metadata(f"{zarrdir}/BASTA.zarr")
+
+    # recalculate DFRs
+    DFR_XKa = (mxpol_resampled['reflectivity'] - mira_resampled['reflectivity']).rename('DFR_XKa')
+    DFR_KaW = (mira_resampled['reflectivity'] - basta_resampled['reflectivity']).rename('DFR_KaW')
+    DFR_XW = (mxpol_resampled['reflectivity'] - basta_resampled['reflectivity']).rename('DFR_XW')
+
+    for arr in (DFR_XKa, DFR_KaW, DFR_XW):
+        arr.encoding.pop('chunks', None)
+        arr.encoding.pop('preferred_chunks', None)
+        for coord in arr.coords:
+            arr[coord].encoding.pop('chunks', None)
+            arr[coord].encoding.pop('preferred_chunks', None)
+
+    mira_path = f"{zarrdir}/MIRA.zarr"
+    mxpol_path = f"{zarrdir}/MXPol.zarr"
+    basta_path = f"{zarrdir}/BASTA.zarr"
+
+    writes = [(mira_path, [DFR_XKa, DFR_KaW]), (mxpol_path, [DFR_XKa, DFR_XW]), (basta_path, [DFR_XW, DFR_KaW]),]
+
+    for path, vars_to_write in writes:
+        z = zarr.open(path, mode='a')
+        for var in vars_to_write:
+            if var.name in z:
+                del z[var.name]
+        zarr.consolidate_metadata(path)
+
+        for var in vars_to_write:
+            var_out = var.drop_vars('range', errors='ignore').chunk({'time': 2880, 'range': -1})
+            var_out.to_dataset().to_zarr(path, mode='a')
+        zarr.consolidate_metadata(path)
+        print(f"overwrote {[v.name for v in vars_to_write]} in {path}")
 
 
 #%% CFADs for BASTA sensitivity
