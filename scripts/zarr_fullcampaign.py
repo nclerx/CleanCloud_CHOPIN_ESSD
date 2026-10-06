@@ -17,7 +17,7 @@ from src import os, pd, xr, zarr, datetime
 from src.constants_input import common_range as range_bins
 from src.constants_input import base_dir, dirs, zarr_variables, att_fn, DFR_fn, BASTAmode, start_date, end_date, radar_ranges, time_bins_radars, BASTAmodes, common_range
 from src.utils import get_DFRdata
-from src.zarr_utils import generate_zarr_encodings, create_empty_zarr, campaign_to_zarr
+from src.zarr_utils import generate_zarr_encodings, create_empty_zarr, campaign_to_zarr, update_spectral_zarr, update_mira_snr
 
 # DFRs = get_DFRdata(DFR_files) # outdated - now using the merged file in which MIRA reflectivities are corrected
 cloudtopDFRs = pd.read_csv(DFR_fn, index_col=0)
@@ -31,7 +31,9 @@ range_bins = common_range
 
 # radars = ['MIRA', 'BASTA', 'MXPol', 'peaktree']
 # radars = ['MIRA', 'MXPol', 'BASTA']
-radars = ['MXPol', 'MIRA']
+# radars = ['MXPol', 'MIRA']
+radars = ['MIRA']
+
 #%% make & fill zarr-files
 
 # zarrdir = f"{dirs['zarr']}/30s_25m"
@@ -84,9 +86,24 @@ for radar in radars:
             print(f"Creating empty zarr for {radar}...")
             ds = create_empty_zarr(zarr_path, radar, time_bins, range_bins, encodings[radar], drop_spectral=drop_spectral)        
 
-campaign_to_zarr(pd.date_range(start_date, end_date), precip_times=time_precip, dirs=dirs, DFRs=cloudtopDFRs, att_fn=att_fn, 
-                 zarrdir=zarrdir, encodings=encodings, BASTAmode=BASTAmode, radars=radars, interp_method=method,
-                 resample_time=resample_time, resample_time_interval=t_res, resample_range=resample_range, drop_spectral=drop_spectral)
+# campaign_to_zarr(pd.date_range(start_date, end_date), precip_times=time_precip, dirs=dirs, DFRs=cloudtopDFRs, att_fn=att_fn, 
+#                  zarrdir=zarrdir, encodings=encodings, BASTAmode=BASTAmode, radars=radars, interp_method=method,
+#                  resample_time=resample_time, resample_time_interval=t_res, resample_range=resample_range, drop_spectral=drop_spectral)
+
+dates = pd.date_range(start_date, end_date)
+update_spectral_zarr(dates, dirs=dirs, zarrdir=zarrdir, encodings=encodings, radar='MIRA', noise_method='hildebrandsekhon')
+
+dirs_to_update = [f"{dirs['zarr']}/30s_25m", f"{dirs['zarr']}/no_resampling", f"{dirs['zarr']}/no_resampling_wspectral"]
+
+failed = {}
+for zarrdir in dirs_to_update:
+    try:
+        failed[zarrdir] = update_mira_snr(dates, dirs=dirs, zarrdir=zarrdir, encodings=encodings)
+    except (KeyError, ValueError, TypeError) as e:
+        print(f"{zarrdir}: not updated, {type(e).__name__}: {e}", flush=True)
+
+
+
 
 
 

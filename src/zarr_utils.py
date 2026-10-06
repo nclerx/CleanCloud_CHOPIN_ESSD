@@ -8,9 +8,10 @@ project_path = '/home/clerx/scripts/chopin_processing'
 if project_path not in sys.path:
     sys.path.insert(0, project_path)
 
-from src import os, np, pd, da, zarr, xr, plt, LogNorm, time
+from src import glob, os, np, pd, da, zarr, xr, plt, LogNorm, time, gc
+from src.utils import find_MIRA_files
 from src.constants_input import default_variable_maps, radar_altitude, zarr_variables, doppler_dim_map, doppler_dims, time_bins_radars, ranges
-from src.radar_processing import load_zenithdata
+from src.radar_processing import load_zenithdata, preprocess_MIRA
 from src.utils import find_temperature_altitude_xr, format_elapsed, align_times_to_grid, safe_reindex, safe_reindex_dim
 
 from typing import List, Dict, Optional
@@ -178,279 +179,603 @@ def campaign_to_zarr(
     """process/prepare campaign data and append to zarr datasets for each radar"""
     if not resample_time and not resample_range:
         print('Skipping DFR calculations, datasets not aligned', flush=True)
-
+ 
     for date in dates:
         ts_start = pd.Timestamp.now()
         day_start = pd.Timestamp(date).normalize()
         day_end = day_start + pd.Timedelta(days=1)
-
+ 
         if drop_spectral:
             periods = [(day_start, day_end)]
         else:
             periods = [(day_start + pd.Timedelta(hours=h), day_start + pd.Timedelta(hours=h+1)) for h in range(24)]
-        
+ 
         for period_start, period_end in periods:
             print(f"\nProcessing data for {date.strftime('%Y-%m-%d')} between {period_start.strftime('%H:%M')} and {period_end.strftime('%H:%M')}", flush=True)
-
+ 
+            datasets = {}
+            DFR_XKa = DFR_XW = DFR_KaW = None
             try:
-                datasets = load_zenithdata(
-                    date, dirs, DFRs, att_fn, BASTAmode,
-                    useMXPol=('MXPol' in radars),
-                    useMIRA=('MIRA' in radars),
-                    useBASTA=('BASTA' in radars),
-                    peakTree=('peaktree' in radars),
-                    resample_time=resample_time,
-                    target_time=resample_time_interval,
-                    resample_range=resample_range,
-                    interp_method=interp_method,
-                    ERA=True,
-                    drop_spectral=drop_spectral,
-                    start_time=period_start,
-                    end_time=period_end
-                )
-            except Exception as e:
-                print(f"Failed to load data for {date.strftime('%Y-%m-%d')}: {e}", flush=True)
+                try:
+                    datasets = load_zenithdata(
+                        date, dirs, DFRs, att_fn, BASTAmode,
+                        useMXPol=('MXPol' in radars),
+                        useMIRA=('MIRA' in radars),
+                        useBASTA=('BASTA' in radars),
+                        peakTree=('peaktree' in radars),
+                        resample_time=resample_time,
+                        target_time=resample_time_interval,
+                        resample_range=resample_range,
+                        interp_method=interp_method,
+                        ERA=ERA,
+                        drop_spectral=drop_spectral,
+                        start_time=period_start,
+                        end_time=period_end
+                    )
+                except Exception as e:
+                    print(f"Failed to load data for {date.strftime('%Y-%m-%d')}: {e}", flush=True)
+                    continue
+ 
+                # correctly add SNR-mask (naming is inversed at the moment i.e. _full contains the filtered data)
+                if 'MXPol' in datasets:
+                    full_vars = [var for var in datasets['MXPol'].data_vars if '_full' in var]
+                    SNRmask = (datasets['MXPol']['SNRh'] > -5) & (datasets['MXPol']['SNRv'] > -5)
+                    vars_to_mask = [var for var in datasets['MXPol'].data_vars if var not in full_vars and datasets['MXPol'][var].dims == ('time', 'range')]
+                    for var in vars_to_mask:
+                        datasets['MXPol'][var] = datasets['MXPol'][var].where(SNRmask)
+ 
+                # correct MIRA reflectivity and LDR values (following MBP mail 28.05.2026)
+                if 'MIRA' in datasets:
+                    datasets['MIRA']['Z'] = datasets['MIRA']['Z'] + 0.89
+                    datasets['MIRA']['LDR'] = datasets['MIRA']['LDRg'] - 0.89
+ 
+                if 'BASTA' in datasets:
+                    datasets['BASTA']['reflectivity_attn_DFR_corrected'] = datasets['BASTA']['reflectivity_attn_DFR_corrected'] + 0.89
+ 
+                # compute DFRs (if datasets have the same time & range resolutions only)
+                if resample_time and resample_range:
+                    try:
+                        if 'MXPol' in datasets and 'MIRA' in datasets:
+                            DFR_XKa = datasets['MXPol']['Zh_full'] - datasets['MIRA']['Z']
+                            datasets['MIRA']['DFR_XKa'] = datasets['MXPol']['DFR_XKa'] = DFR_XKa
+                        if 'MIRA' in datasets and 'BASTA' in datasets:
+                            DFR_KaW = datasets['MIRA']['Z'] - datasets['BASTA']['reflectivity_attn_DFR_corrected']
+                            datasets['MIRA']['DFR_KaW'] = datasets['BASTA']['DFR_KaW'] = DFR_KaW
+                        if 'MXPol' in datasets and 'BASTA' in datasets:
+                            DFR_XW = datasets['MXPol']['Zh_full'] - datasets['BASTA']['reflectivity_attn_DFR_corrected']
+                            datasets['MXPol']['DFR_XW'] = datasets['BASTA']['DFR_XW'] = DFR_XW
+                    except Exception as e:
+                        print(f"    Failed to compute DFRs: {e}", flush=True)
+ 
+                for radar in radars:
+                    if radar not in datasets:
+                        print(f"No data for {radar} between {period_start.strftime('%Y-%m-%d %H:%M')} and {period_end.strftime('%Y-%m-%d %H:%M')}")
+                        continue
+ 
+                    print(f"\n--- Preparing {radar} data for {period_start.strftime('%Y-%m-%d %H:%M')} to {period_end.strftime('%Y-%m-%d %H:%M')} at {ts_start.strftime('%H:%M:%S (%Y-%m-%d)')} ---", flush=True)
+                    ts_zarr = pd.Timestamp.now()
+ 
+                    ds = daily_ds = ds_to_write = ds_encoded = zarr_ds = z_store = data = zdi = None
+                    selected_vars = {}
+                    try:
+                        ds = datasets[radar]
+                        ds = ds.chunk({'time': 3600, 'range': -1})  # rechunk for more efficient processing
+                        variables_map = default_variable_maps.get(radar, {})
+ 
+                        # peaktree dimension reduction
+                        if radar == 'peaktree':
+                            keep_vars = list(variables_map.values())
+                            ds = ds[keep_vars]
+                            for dim in ['mode', 'nodes']:
+                                if dim in ds.dims:
+                                    ds = ds.isel({dim: 0})
+                            if 'vel' in ds.dims:
+                                ds = ds.max(dim='vel', keep_attrs=True).compute()
+ 
+                        for canon, varname in variables_map.items():
+                            if varname in ds:
+                                da_var = ds[varname]
+                                if 'clean_mask' in ds and {'time', 'range'} <= set(da_var.dims):
+                                    da_var = da_var.where(ds['clean_mask'])
+                                selected_vars[canon] = da_var
+ 
+                        # add DFRs
+                        if DFR_XKa is not None and radar in ['MXPol', 'MIRA']:
+                            selected_vars['DFR_XKa'] = DFR_XKa
+                        if DFR_XW is not None and radar in ['MXPol', 'BASTA']:
+                            selected_vars['DFR_XW'] = DFR_XW
+                        if DFR_KaW is not None and radar in ['MIRA', 'BASTA']:
+                            selected_vars['DFR_KaW'] = DFR_KaW
+ 
+                        # precipitation flag
+                        radar_times = pd.to_datetime(ds.time.values)
+                        if hasattr(precip_times, 'dtype') and precip_times.dtype == 'bool':
+                            precip_times = precip_times.index
+                        nearest_precip = precip_times.searchsorted(radar_times)
+                        nearest_precip[nearest_precip == len(precip_times)] = len(precip_times) - 1
+                        diff = np.abs((radar_times - precip_times[nearest_precip]).astype('timedelta64[s]').astype(int))
+                        try:
+                            window_seconds = int(pd.to_timedelta(resample_time_interval).total_seconds())
+                        except Exception:
+                            window_seconds = pd.to_timedelta(resample_time_interval).seconds
+                        is_precip = diff <= (window_seconds / 2)
+                        selected_vars['is_precip'] = xr.DataArray(
+                            is_precip,
+                            coords={'time': ds.time},
+                            dims=['time'],
+                            name='is_precip'
+                        )
+ 
+                        if not selected_vars:
+                            print(f"    No variables to write for {radar}, skipping.", flush=True)
+                            continue
+ 
+                        daily_ds = xr.Dataset(selected_vars).sel(time=slice(period_start, period_end))
+ 
+                        # ERA zdi interpolation
+                        if ERA and 'ERA' in datasets:
+                            try:
+                                zdi = find_temperature_altitude_xr(datasets['ERA'], alt_range=(0, 15e3),
+                                                                   radar_altitude=radar_altitude, temps=[0])
+                                zdi = zdi.interp(time=daily_ds['time'], method='nearest')
+                                daily_ds['zdi'] = zdi['z0degC']
+                            except Exception as e:
+                                print(f"    Failed to compute 0°C isotherm altitude: {e}", flush=True)
+ 
+                        # remove duplicate times
+                        if 'time' in daily_ds:
+                            daily_ds = daily_ds.sortby('time')
+                            _, idx = np.unique(daily_ds['time'], return_index=True)
+                            daily_ds = daily_ds.isel(time=idx)
+ 
+                        if not resample_time:  # make sure to map times to zarr-times
+                            full_target = time_bins_radars[radar]
+ 
+                            interval_mask = (full_target >= period_start) & (full_target <= period_end)
+                            target_time = full_target[interval_mask]
+ 
+                            if len(target_time) == 0:
+                                print(f"    Warning: no target_time for {radar} on {date}", flush=True)
+                            else:
+                                time_diff = np.abs(daily_ds.time.values.astype("datetime64[ns]") - target_time.values.astype("datetime64[ns]")[:len(daily_ds.time)])
+                                if len(daily_ds.time) != len(target_time) or np.any(time_diff > np.timedelta64(1, 'ms')):
+                                    daily_ds = align_times_to_grid(daily_ds, target_time)
+ 
+                        # open zarr
+                        zarr_path = os.path.join(zarrdir, f"{radar}.zarr") if not radar == 'BASTA' else os.path.join(zarrdir, f"{radar}_{BASTAmode}.zarr")
+                        if not os.path.exists(zarr_path):
+                            print(f"    Zarr file missing for {radar}, skipping.", flush=True)
+                            continue
+                        zarr_ds = xr.open_zarr(zarr_path)
+ 
+                        zarr_times = zarr_ds.time.values
+                        overlapping_times = np.intersect1d(daily_ds.time.values, zarr_times)
+                        if len(overlapping_times) == 0:
+                            print(f"    No overlapping times for {radar}, skipping.", flush=True)
+                            continue
+ 
+                        # compute write region in zarr
+                        daily_ds = daily_ds.sel(time=overlapping_times)
+                        zarr_time_mask = np.isin(zarr_times, overlapping_times)
+                        if not zarr_time_mask.any():
+                            print(f"    No matching times in Zarr store!", flush=True)
+                            continue
+ 
+                        true_indices = np.where(zarr_time_mask)[0]
+                        start, stop = true_indices[0], true_indices[-1] + 1
+ 
+                        if (stop - start) != len(daily_ds.time):
+                            print(f"    ERROR: Region size mismatch for {radar} on {date.strftime('%Y-%m-%d')}:", flush=True)
+                            print(f"Region: slice({start}, {stop}) = {stop - start} steps", flush=True)
+                            print(f"Data to write: {len(daily_ds.time)} steps", flush=True)
+                            continue
+ 
+                        # drop non-time variables and missing variables
+                        drop_non_time = [
+                            v for v in daily_ds.variables
+                            if 'time' not in daily_ds[v].dims
+                            and v not in ['range', 'doppler', 'time']
+                        ]
+                        ds_to_write = daily_ds.drop_vars(drop_non_time, errors='ignore')
+ 
+                        # reindex ranges to ensure match
+                        zarr_ranges = zarr_ds['range'].values
+                        if 'range' in ds_to_write.dims and radar in ranges:
+                            tol = ranges[radar].get('tol', None)
+                            ds_to_write = ds_to_write.reindex({'range': zarr_ranges}, method='nearest', tolerance=tol)
+ 
+                        missing_vars = set(ds_to_write.data_vars) - set(zarr_ds.data_vars)
+                        if missing_vars:
+                            print(f"    Dropping variables not in zarr for {radar}: {missing_vars}", flush=True)
+                            ds_to_write = ds_to_write.drop_vars(missing_vars)
+ 
+                        # doppler dimension renaming
+                        doppler_dim = doppler_dim_map.get(radar)
+                        if doppler_dim and doppler_dim != 'doppler':
+                            vars_with_doppler = [var for var in ds_to_write.data_vars if doppler_dim in ds_to_write[var].dims]
+                            if vars_with_doppler:
+                                for var in vars_with_doppler:
+                                    ds_to_write[var] = ds_to_write[var].rename({doppler_dim: 'doppler'})
+                                if doppler_dim in ds_to_write.coords:
+                                    ds_to_write = ds_to_write.rename({doppler_dim: 'doppler'})
+ 
+                        # clip variables to defined ranges
+                        for var in ds_to_write.data_vars:
+                            if var in encodings[radar] and 'range' in zarr_variables[radar][var]:
+                                vmin, vmax = zarr_variables[radar][var]['range']
+                                data = ds_to_write[var].astype(float).where(np.isfinite(ds_to_write[var]))
+                                data = data.clip(min=vmin, max=vmax)
+                                ds_to_write[var] = data.compute()
+ 
+                        # rechunk if specified
+                        rechunk_dict = {}
+                        for var in ds_to_write.data_vars:
+                            if 'chunks' in encodings[radar].get(var, {}):
+                                dims = ds_to_write[var].dims
+                                rechunk_dict[var] = dict(zip(dims, encodings[radar][var]['chunks']))
+                        if rechunk_dict:
+                            ds_to_write = ds_to_write.chunk(rechunk_dict)
+ 
+                        # write to zarr
+                        for coord in ['range', 'doppler']:
+                            if coord in ds_to_write.data_vars and not coord in ds_to_write.coords:
+                                ds_to_write = ds_to_write.set_coords(coord)
+ 
+                        vars_to_write = [v for v in ds_to_write.data_vars if 'time' in ds_to_write[v].dims]
+                        coords_to_drop = ['range'] if drop_spectral else ['range', 'doppler']
+                        ds_to_write = ds_to_write[vars_to_write].drop_vars(coords_to_drop, errors='ignore')
+                        ds_encoded = preprocess_for_zarr(ds_to_write, encodings[radar]).compute()
+ 
+                        z_store = zarr.open_group(zarr_path, mode='r+')
+                        try:
+                            for var in ds_encoded.data_vars:
+                                if var not in z_store:
+                                    print(f"Warning: {var} not in zarr store, skipping")
+                                    continue
+ 
+                                data = ds_encoded[var].values
+                                # write directly to the zarr array at the specified region
+                                if data.ndim == 2:  # (time, range)
+                                    z_store[var][start:stop, :] = data
+                                elif data.ndim == 1:  # (time,)
+                                    z_store[var][start:stop] = data
+                                elif data.ndim == 3:  # (time, range, doppler)
+                                    z_store[var][start:stop, :, :] = data
+ 
+                            zarr.consolidate_metadata(zarr_path)
+                        except Exception as e:
+                            print(f"    ERROR writing to zarr for {radar}: {e}", flush=True)
+                            continue
+ 
+                        ts_end = pd.Timestamp.now()
+                        print(f"    Wrote {len(overlapping_times)} timesteps for {radar} on {ts_end.strftime('%H:%M:%S (%Y-%m-%d)')}", flush=True)
+                        print(f"    (elapsed time for loading & appending data to zarr: {format_elapsed((ts_end - ts_zarr).total_seconds())}", flush=True)
+ 
+                    except Exception as e:
+                        # an unexpected error for one radar no longer stops the whole run
+                        print(f"    ERROR processing {radar} for {period_start.strftime('%Y-%m-%d %H:%M')}: {type(e).__name__}: {e}", flush=True)
+ 
+                    finally:
+                        # runs after every radar, also after `continue` and errors
+                        if zarr_ds is not None:
+                            zarr_ds.close()
+                        store = getattr(z_store, 'store', None)
+                        if store is not None and hasattr(store, 'close'):
+                            store.close()
+                        del ds, daily_ds, ds_to_write, ds_encoded, zarr_ds, z_store, data, zdi, selected_vars
+ 
+            finally: # close all source files opened by load_zenithdata and free memory
+                for d in datasets.values():
+                    if hasattr(d, 'close'):
+                        d.close()
+                del datasets, DFR_XKa, DFR_XW, DFR_KaW
+                gc.collect()
+
+
+def update_mira_snr(dates, dirs, zarrdir, encodings, radar='MIRA',
+                    target_vars=('snrh', 'snrv'), source_vars=('SNRg', 'SNRcx'),
+                    snr_range=(-40., 70.)):
+    """
+    Recompute the SNR variables in an existing zarr store from the MIRA source files,
+    hour by hour, and update the variables' attributes/encoding to the new range.
+
+    The full (unmasked) linear SNR is regridded onto the zarr grid, then converted to dB;
+    values outside snr_range (default [-40, 70] dB) are set to NaN.
+
+    Regridding adapts to the target zarr: bin-average in linear units where the zarr's
+    time/range spacing is coarser than MIRA's, nearest-neighbour matching otherwise.
+    Negative (noise-subtracted) linear values are kept during averaging so bin averages
+    stay unbiased, and only dropped before the dB conversion.
+
+    dates : list of dates to update (None -> all dates in the store)
+    target_vars : SNR variable names in the zarr
+    source_vars : corresponding (linear) SNR variables in the MIRA files
+    snr_range : valid range in dB; values outside are set to NaN
+
+    Returns the list of hours (start times) that failed, so they can be rerun.
+    """
+    def _to_num(x):
+        x = np.asarray(x)
+        if np.issubdtype(x.dtype, np.datetime64):
+            return x.astype('datetime64[ns]').astype('int64').astype(float)
+        return x.astype(float)
+
+    def _regrid(da, dim, target, tgt_step, tol, factor=1.5):
+        """Bin-average onto target if the target is coarser than the source, else nearest."""
+        src, tgt = _to_num(da[dim].values), _to_num(target)
+        src_step = np.median(np.diff(src)) if len(src) > 1 else tgt_step
+        if tgt_step > factor * src_step:
+            mid = (tgt[:-1] + tgt[1:]) / 2
+            edges = np.concatenate([[tgt[0] - tgt_step / 2], mid, [tgt[-1] + tgt_step / 2]])
+            idx = np.searchsorted(edges, src, side='right') - 1
+            ok = (idx >= 0) & (idx < len(tgt))
+            out = (da.isel({dim: np.flatnonzero(ok)})
+                     .assign_coords(_bin=(dim, idx[ok]))
+                     .groupby('_bin').mean(dim))
+            out = out.reindex(_bin=np.arange(len(tgt))).rename({'_bin': dim})
+            return out.assign_coords({dim: np.asarray(target)})
+        return da.reindex({dim: np.asarray(target)}, method='nearest', tolerance=tol)
+
+    if radar != 'MIRA':
+        raise NotImplementedError("loading is only implemented for MIRA")
+    if len(target_vars) != len(source_vars):
+        raise ValueError("target_vars and source_vars must have the same length")
+    var_map = dict(zip(target_vars, source_vars))
+
+    # --- target grid and variable dims from the zarr store ---
+    zarr_path = os.path.join(zarrdir, f"{radar}.zarr")
+    zarr_ds = xr.open_zarr(zarr_path)
+    missing = [v for v in target_vars if v not in zarr_ds]
+    if missing:
+        zarr_ds.close()
+        raise KeyError(f"{missing} not in {zarr_path}")
+    tgt_dims = {v: zarr_ds[v].dims for v in target_vars}
+    zarr_times = pd.DatetimeIndex(zarr_ds['time'].values)
+    zarr_ranges = zarr_ds['range'].values
+    zarr_ds.close()
+
+    # --- grid spacing and tolerances, derived from the target zarr ---
+    t_step = np.median(np.diff(_to_num(zarr_times.values)))          # ns
+    r_step = np.median(np.diff(zarr_ranges.astype(float)))
+    time_tol = pd.Timedelta(t_step / 2, 'ns')
+    range_tol = ranges.get(radar, {}).get('tol') or r_step / 2
+    pad = max(pd.Timedelta('1min'), pd.Timedelta(t_step, 'ns'))
+
+    all_dates = pd.DatetimeIndex(zarr_times.normalize().unique())
+    dates = all_dates if dates is None else pd.DatetimeIndex(pd.to_datetime(dates)).normalize()
+    full_rewrite = set(all_dates) <= set(dates)
+
+    z_store = zarr.open_group(zarr_path, mode='r+')
+
+    # --- check and update encoding/attributes per variable, before writing any data ---
+    for target_var in target_vars:
+        z_arr = z_store[target_var]
+        dims = tgt_dims[target_var]
+        if dims[0] != 'time':
+            raise ValueError(f"{target_var}: expected 'time' as first dimension, got {dims}")
+
+        dummy = xr.Dataset({target_var: xr.DataArray(np.full((1,) * len(dims), snr_range[0]), dims=dims)})
+        dummy_enc = preprocess_for_zarr(dummy, encodings[radar])[target_var]
+        if dummy_enc.dtype != z_arr.dtype:
+            raise TypeError(f"{target_var}: encoded dtype {dummy_enc.dtype} != stored dtype {z_arr.dtype}; "
+                            "the array has to be recreated for this encoding")
+        packing_changed = any(z_arr.attrs.get(k) != dummy_enc.attrs.get(k)
+                              for k in ('scale_factor', 'add_offset'))
+        if packing_changed and not full_rewrite:
+            raise ValueError(f"{target_var}: scale_factor/add_offset change, so all dates in the store "
+                             "must be rewritten (pass dates=None)")
+
+        new_attrs = {k: v for k, v in dummy_enc.attrs.items() if k != '_FillValue'}
+        new_attrs.update(valid_min=snr_range[0], valid_max=snr_range[1], units='dB')
+        z_arr.attrs.update(new_attrs)
+        print(f"Updating {target_var} in {zarr_path} "
+              f"(dt={pd.Timedelta(t_step, 'ns')}, dr={r_step:g} m, packing changed: {packing_changed})",
+              flush=True)
+
+    # --- recompute hour by hour ---
+    failed = []
+    for date in dates:
+        for h in range(24):
+            t0 = date + pd.Timedelta(hours=h)
+            t1 = t0 + pd.Timedelta(hours=1)
+            start, stop = zarr_times.searchsorted([t0, t1])
+            if start == stop:
                 continue
 
-            # correctly add SNR-mask (naming is inversed at the moment i.e. _full contains the filtered data)
-            if 'MXPol' in datasets:
-                full_vars = [var for var in datasets['MXPol'].data_vars if '_full' in var]
-                SNRmask = (datasets['MXPol']['SNRh'] > -5) & (datasets['MXPol']['SNRv'] > -5)
-                vars_to_mask = [var for var in datasets['MXPol'].data_vars if var not in full_vars and datasets['MXPol'][var].dims == ('time', 'range')]
-                for var in vars_to_mask:
-                    datasets['MXPol'][var] = datasets['MXPol'][var].where(SNRmask)
-
-            # correct MIRA reflectivity and LDR values (following MBP mail 28.05.2026) 
-            if 'MIRA' in datasets: 
-                datasets['MIRA']['Z'] = datasets['MIRA']['Z'] + 0.89 
-                datasets['MIRA']['LDR'] = datasets['MIRA']['LDRg'] - 0.89 
-
-            if 'BASTA' in datasets:
-                datasets['BASTA']['reflectivity_attn_DFR_corrected'] = datasets['BASTA']['reflectivity_attn_DFR_corrected'] + 0.89
-
-            # compute DFRs (if datasets have the same time & range resolutions only)
-            DFR_XKa = DFR_XW = DFR_KaW = None
-            if resample_time and resample_range:
-                try:
-                    if 'MXPol' in datasets and 'MIRA' in datasets:
-                        DFR_XKa = datasets['MXPol']['Zh_full'] - datasets['MIRA']['Z']
-                        datasets['MIRA']['DFR_XKa'] = datasets['MXPol']['DFR_XKa'] = DFR_XKa
-                    if 'MIRA' in datasets and 'BASTA' in datasets:
-                        DFR_KaW = datasets['MIRA']['Z'] - datasets['BASTA']['reflectivity_attn_DFR_corrected']
-                        datasets['MIRA']['DFR_KaW'] = datasets['BASTA']['DFR_KaW'] = DFR_KaW
-                    if 'MXPol' in datasets and 'BASTA' in datasets:
-                        DFR_XW = datasets['MXPol']['Zh_full'] - datasets['BASTA']['reflectivity_attn_DFR_corrected']
-                        datasets['MXPol']['DFR_XW'] = datasets['BASTA']['DFR_XW'] = DFR_XW
-                except Exception as e:
-                    print(f"    Failed to compute DFRs: {e}", flush=True)
-
-            for radar in radars:
-                if radar not in datasets:
-                    print(f"No data for {radar} between {period_start.strftime('%Y-%m-%d %H:%M')} and {period_end.strftime('%Y-%m-%d %H:%M')}")
+            ts = pd.Timestamp.now()
+            ds = None
+            try:
+                pattern = f"{dirs['MIRA']}/{t0.year}/{t0.month:02}/{t0.day:02}/{t0:%Y%m%d}*_merged.nc"
+                files = find_MIRA_files(sorted(glob.glob(pattern)), t0 - pad, t1 + pad)
+                if not files:
+                    print(f"{t0:%Y-%m-%d %H:%M}: no MIRA files, skipping", flush=True)
                     continue
+                ds = xr.open_mfdataset(files).sel(time=slice(t0 - pad, t1 + pad))
+                ds = preprocess_MIRA(ds)
 
-                print(f"\n--- Preparing {radar} data for {period_start.strftime('%Y-%m-%d %H:%M')} to {period_end.strftime('%Y-%m-%d %H:%M')} at {ts_start.strftime('%H:%M:%S (%Y-%m-%d)')} ---", flush=True)
-                ts_zarr = pd.Timestamp.now()
-                ds = datasets[radar]
-                ds = ds.chunk({'time': 3600, 'range': -1})  # rechunk for more efficient processing
-                variables_map = default_variable_maps.get(radar, {})
+                written = []
+                for target_var, src_var in var_map.items():
+                    if src_var not in ds:
+                        print(f"{t0:%Y-%m-%d %H:%M}: {src_var} not found, skipping {target_var}", flush=True)
+                        continue
 
-                # peaktree dimension reduction
-                if radar == 'peaktree':
-                    keep_vars = list(variables_map.values())
-                    ds = ds[keep_vars]
-                    for dim in ['mode', 'nodes']:
-                        if dim in ds.dims:
-                            ds = ds.isel({dim: 0})
-                    if 'vel' in ds.dims:
-                        ds = ds.max(dim='vel', keep_attrs=True).compute()
+                    # full linear SNR, regridded with negative noise values kept (unbiased averages)
+                    lin = ds[src_var].sortby('time')
+                    lin = _regrid(lin, 'time', zarr_times[start:stop].values, t_step, time_tol)
+                    lin = _regrid(lin, 'range', zarr_ranges, r_step, range_tol)
+                    lin = lin.load()
 
-                selected_vars = {}
-                for canon, varname in variables_map.items():
-                    if varname in ds:
-                        da_var = ds[varname]
-                        if 'clean_mask' in ds and {'time', 'range'} <= set(da_var.dims):
-                            da_var = da_var.where(ds['clean_mask'])
-                        selected_vars[canon] = da_var
+                    # to dB (non-positive linear SNR has no dB value), NaN outside snr_range
+                    snr_db = 10 * np.log10(lin.where(lin > 0))
+                    n_high = int((snr_db > snr_range[1]).sum())
+                    snr_db = snr_db.where((snr_db >= snr_range[0]) & (snr_db <= snr_range[1]))
+                    if n_high:
+                        print(f"{t0:%Y-%m-%d %H:%M}: {target_var}: {n_high} values > {snr_range[1]} dB set to NaN",
+                              flush=True)
 
-                # add DFRs
-                if DFR_XKa is not None and radar in ['MXPol', 'MIRA']:
-                    selected_vars['DFR_XKa'] = DFR_XKa
-                if DFR_XW is not None and radar in ['MXPol', 'BASTA']:
-                    selected_vars['DFR_XW'] = DFR_XW
-                if DFR_KaW is not None and radar in ['MIRA', 'BASTA']:
-                    selected_vars['DFR_KaW'] = DFR_KaW
+                    ds_new = xr.Dataset({target_var: snr_db.transpose(*tgt_dims[target_var])})
+                    ds_enc = preprocess_for_zarr(ds_new.drop_vars(['range'], errors='ignore'),
+                                                 encodings[radar]).compute()
+                    z_store[target_var][start:stop, ...] = ds_enc[target_var].values
+                    written.append(target_var)
 
-                # precipitation flag
-                radar_times = pd.to_datetime(ds.time.values)
-                if hasattr(precip_times, 'dtype') and precip_times.dtype == 'bool':
-                    precip_times = precip_times.index
-                nearest_precip = precip_times.searchsorted(radar_times)
-                nearest_precip[nearest_precip == len(precip_times)] = len(precip_times) - 1
-                diff = np.abs((radar_times - precip_times[nearest_precip]).astype('timedelta64[s]').astype(int))
-                try:
-                    window_seconds = int(pd.to_timedelta(resample_time_interval).total_seconds())
-                except Exception:
-                    window_seconds = pd.to_timedelta(resample_time_interval).seconds
-                is_precip = diff <= (window_seconds / 2)
-                selected_vars['is_precip'] = xr.DataArray(
-                    is_precip,
-                    coords={'time': ds.time},
-                    dims=['time'],
-                    name='is_precip'
-                )
+                elapsed = (pd.Timestamp.now() - ts).total_seconds()
+                print(f"{t0:%Y-%m-%d %H:%M}: wrote {stop - start} steps of {written} ({elapsed:.0f} s)",
+                      flush=True)
 
-                if not selected_vars:
-                    print(f"    No variables to write for {radar}, skipping.", flush=True)
+            except Exception as e:
+                print(f"{t0:%Y-%m-%d %H:%M}: ERROR {type(e).__name__}: {e}", flush=True)
+                failed.append(t0)
+
+            finally:
+                if ds is not None:
+                    ds.close()
+                gc.collect()
+
+    try:
+        zarr.consolidate_metadata(zarr_path)   # so open_zarr sees the new attributes
+    except Exception as e:
+        print(f"could not consolidate metadata: {e}", flush=True)
+
+    if failed:
+        print(f"{len(failed)} hours failed: {[f'{t:%Y-%m-%d %H:%M}' for t in failed]}", flush=True)
+    return failed
+
+
+def update_spectral_zarr(dates, dirs, zarrdir, encodings, radar='MIRA', noise_method='hildebrandsekhon',
+                         extra_vars=('Z', 'LDR'), time_tol='2.5s', range_tol=None, pad='1min'):
+    """
+    Recompute the spectral variables (those with a Doppler dimension) plus the variables in
+    extra_vars of an existing zarr store, and overwrite them in place, hour by hour. All other
+    variables in the store are left untouched, and only the MIRA files needed for each hour are loaded.
+ 
+    Z and LDR get the calibration correction (following MBP mail 28.05.2026):
+        Z = Z + Z_offset,  LDR = LDRg - Z_offset
+    Everything is recomputed from the source files, so running this twice does not apply
+    the correction twice.
+ 
+    dates : list of dates to update
+    noise_method : passed to preprocess_MIRA (None, 'quantile' or 'hildebrandsekhon')
+    extra_vars : non-spectral MIRA variables (source names) to update as well
+    Z_offset : calibration offset in dB
+    time_tol : max. time difference when mapping MIRA times onto the zarr time grid
+    range_tol : max. range difference when mapping onto the zarr range grid
+        (default: ranges[radar]['tol'])
+    pad : extra data loaded on either side of each hour, so edge times can be matched
+    """
+    if radar != 'MIRA':
+        raise NotImplementedError("loading is only implemented for MIRA")
+ 
+    # --- read the target grid and the variables to update from the zarr store (once) ---
+    zarr_path = os.path.join(zarrdir, f"{radar}.zarr")
+    zarr_ds = xr.open_zarr(zarr_path)
+    zarr_dims = {v: zarr_ds[v].dims for v in zarr_ds.data_vars}
+    zarr_times = pd.DatetimeIndex(zarr_ds['time'].values)
+    zarr_ranges = zarr_ds['range'].values
+    zarr_doppler = zarr_ds['doppler'].values if 'doppler' in zarr_ds.variables else None
+    zarr_ds.close()
+ 
+    # zarr (canonical) name -> variable name in the MIRA dataset:
+    # all spectral variables plus the extra variables, if they exist in the zarr
+    variables_map = {canon: name for canon, name in default_variable_maps.get(radar, {}).items()
+                     if canon in zarr_dims and ('doppler' in zarr_dims[canon] or name in extra_vars)}
+    if not variables_map:
+        print(f"No variables to update in {zarr_path}.", flush=True)
+        return
+    print(f"Updating {list(variables_map)} in {zarr_path}", flush=True)
+ 
+    doppler_dim = doppler_dim_map.get(radar) or 'doppler'
+    if range_tol is None:
+        range_tol = ranges.get(radar, {}).get('tol')
+    time_tol, pad = pd.Timedelta(time_tol), pd.Timedelta(pad)
+ 
+    z_store = zarr.open_group(zarr_path, mode='r+')
+ 
+    for date in dates:
+        day_start = pd.Timestamp(date).normalize()
+ 
+        for h in range(24):
+            t0 = day_start + pd.Timedelta(hours=h)
+            t1 = t0 + pd.Timedelta(hours=1)
+ 
+            # zarr region for this hour: [t0, t1), so every time step is written exactly once
+            start, stop = zarr_times.searchsorted([t0, t1])
+            if start == stop:
+                continue
+ 
+            ts = pd.Timestamp.now()
+            ds = ds_new = ds_enc = None
+            try:
+                # load only the MIRA files (and times) needed for this hour
+                file_pattern = f"{dirs['MIRA']}/{t0.year}/{t0.month:02}/{t0.day:02}/{t0:%Y%m%d}*_merged.nc"
+                files = find_MIRA_files(sorted(glob.glob(file_pattern)), t0 - pad, t1 + pad)
+                if not files:
+                    print(f"{t0:%Y-%m-%d %H:%M}: no MIRA files, skipping", flush=True)
                     continue
-
-                daily_ds = xr.Dataset(selected_vars).sel(time=slice(period_start, period_end))
-
-                # ERA zdi interpolation
-                if ERA and 'ERA' in datasets:
-                    try:
-                        zdi = find_temperature_altitude_xr(datasets['ERA'], alt_range=(0, 15e3),
-                                                        radar_altitude=radar_altitude, temps=[0])
-                        zdi = zdi.interp(time=daily_ds['time'], method='nearest')
-                        daily_ds['zdi'] = zdi['z0degC']
-                    except Exception as e:
-                        print(f"    Failed to compute 0°C isotherm altitude: {e}", flush=True)
-
-                # remove duplicate times
-                if 'time' in daily_ds:
-                    daily_ds = daily_ds.sortby('time')
-                    _, idx = np.unique(daily_ds['time'], return_index=True)
-                    daily_ds = daily_ds.isel(time=idx)
-
-                if not resample_time: # make sure to map times to zarr-times
-                    full_target = time_bins_radars[radar]
-                    
-                    interval_mask = (full_target >= period_start) & (full_target <= period_end)
-                    target_time = full_target[interval_mask]
-
-                    if len(target_time) == 0:
-                        print(f"    Warning: no target_time for {radar} on {date}", flush=True)
+                ds = xr.open_mfdataset(files).sel(time=slice(t0 - pad, t1 + pad))
+                ds = preprocess_MIRA(ds, drop_spectral=False, noise_method=noise_method)
+ 
+                # calibration correction for Z and LDR (following MBP mail 28.05.2026)
+                ds['Z'] = ds['Z'] + 0.89
+                ds['LDR'] = ds['LDRg'] - 0.89
+ 
+                # keep only the variables to update (in the zarr's names), with the clean mask applied
+                selected = {}
+                for canon, name in variables_map.items():
+                    if name in ds:
+                        da = ds[name]
+                        if 'clean_mask' in ds and {'time', 'range'} <= set(da.dims):
+                            da = da.where(ds['clean_mask'])
+                        selected[canon] = da
+                if not selected:
+                    print(f"{t0:%Y-%m-%d %H:%M}: none of the variables found, skipping", flush=True)
+                    continue
+                ds_new = xr.Dataset(selected)
+                if doppler_dim != 'doppler' and doppler_dim in ds_new.dims:
+                    ds_new = ds_new.rename({doppler_dim: 'doppler'})
+ 
+                # map onto the zarr grid: time, range and (by value) doppler
+                ds_new = ds_new.sortby('time')
+                ds_new = ds_new.reindex(time=zarr_times[start:stop], method='nearest', tolerance=time_tol)
+                ds_new = ds_new.reindex(range=zarr_ranges, method='nearest', tolerance=range_tol)
+                if 'doppler' in ds_new.dims:
+                    ds_new = ds_new.sortby('doppler')
+                    if zarr_doppler is not None:
+                        doppler_tol = np.abs(np.diff(zarr_doppler)).min() / 2
+                        ds_new = ds_new.reindex(doppler=zarr_doppler, method='nearest', tolerance=doppler_tol)
                     else:
-                        time_diff = np.abs(daily_ds.time.values.astype("datetime64[ns]") - target_time.values.astype("datetime64[ns]")[:len(daily_ds.time)])
-                        if len(daily_ds.time) != len(target_time) or np.any(time_diff > np.timedelta64(1, 'ms')):
-                            daily_ds = align_times_to_grid(daily_ds, target_time)
-                        else:
-                            pass
-                        
-                # open zarr
-                zarr_path = os.path.join(zarrdir, f"{radar}.zarr") if not radar == 'BASTA' else os.path.join(zarrdir, f"{radar}_{BASTAmode}.zarr")
-                if not os.path.exists(zarr_path):
-                    print(f"    Zarr file missing for {radar}, skipping.", flush=True)
-                    continue
-                zarr_ds = xr.open_zarr(zarr_path)
-
-                zarr_times = zarr_ds.time.values
-                overlapping_times = np.intersect1d(daily_ds.time.values, zarr_times)
-                if len(overlapping_times) == 0:
-                    print(f"    No overlapping times for {radar}, skipping.", flush=True)
-                    zarr_ds.close()
-                    continue
-                
-                # compute write region in zarr
-                daily_ds = daily_ds.sel(time=overlapping_times)
-                zarr_time_mask = np.isin(zarr_times, overlapping_times)
-                if not zarr_time_mask.any():
-                    print(f"    No matching times in Zarr store!", flush=True)
-                    continue
-
-                true_indices = np.where(zarr_time_mask)[0]
-                start, stop = true_indices[0], true_indices[-1] + 1
-
-                if (stop - start) != len(daily_ds.time):
-                    print(f"    ERROR: Region size mismatch for {radar} on {date.strftime('%Y-%m-%d')}:", flush=True)
-                    print(f"Region: slice({start}, {stop}) = {stop - start} steps", flush=True)
-                    print(f"Data to write: {len(daily_ds.time)} steps", flush=True)
-                    zarr_ds.close()
-                    continue
-                
-                # drop non-time variables and missing variables
-                drop_non_time = [
-                    v for v in daily_ds.variables
-                    if 'time' not in daily_ds[v].dims
-                    and v not in ['range', 'doppler', 'time']
-                ]
-                ds_to_write = daily_ds.drop_vars(drop_non_time, errors='ignore')
-
-                # reindex ranges to ensure match
-                zarr_ranges = zarr_ds['range'].values
-                if 'range' in ds_to_write.dims and radar in ranges:
-                    tol = ranges[radar].get('tol', None)
-                    ds_to_write = ds_to_write.reindex({'range': zarr_ranges}, method='nearest', tolerance=tol)
-
-                missing_vars = set(ds_to_write.data_vars) - set(zarr_ds.data_vars)
-                if missing_vars:
-                    print(f"    Dropping variables not in zarr for {radar}: {missing_vars}", flush=True)
-                    ds_to_write = ds_to_write.drop_vars(missing_vars)
-
-                # doppler dimension renaming
-                doppler_dim = doppler_dim_map.get(radar)
-                if doppler_dim and doppler_dim != 'doppler':
-                    vars_with_doppler = [var for var in ds_to_write.data_vars if doppler_dim in ds_to_write[var].dims]
-                    if vars_with_doppler:
-                        for var in vars_with_doppler:
-                            ds_to_write[var] = ds_to_write[var].rename({doppler_dim: 'doppler'})
-                        if doppler_dim in ds_to_write.coords:
-                            ds_to_write = ds_to_write.rename({doppler_dim: 'doppler'})
-
-                # clip variables to defined ranges
-                for var in ds_to_write.data_vars:
-                    if var in encodings[radar] and 'range' in zarr_variables[radar][var]:
-                        vmin, vmax = zarr_variables[radar][var]['range']
-                        data = ds_to_write[var].astype(float).where(np.isfinite(ds_to_write[var]))
-                        data = data.clip(min=vmin, max=vmax)
-                        ds_to_write[var] = data.compute()
-
-                # rechunk if specified
-                rechunk_dict = {}
-                for var in ds_to_write.data_vars:
-                    if 'chunks' in encodings[radar].get(var, {}):
-                        dims = ds_to_write[var].dims
-                        rechunk_dict[var] = dict(zip(dims, encodings[radar][var]['chunks']))
-                if rechunk_dict:
-                    ds_to_write = ds_to_write.chunk(rechunk_dict)
-
-                # write to zarr
-                for coord in ['range', 'doppler']:
-                    if coord in ds_to_write.data_vars and not coord in ds_to_write.coords:
-                        ds_to_write = ds_to_write.set_coords(coord)
-
-                vars_to_write = [v for v in ds_to_write.data_vars if 'time' in ds_to_write[v].dims]
-                coords_to_drop = ['range'] if drop_spectral else ['range', 'doppler']
-                ds_to_write = ds_to_write[vars_to_write].drop_vars(coords_to_drop, errors='ignore')
-                ds_encoded = preprocess_for_zarr(ds_to_write, encodings[radar]).compute()
-
-                z_store = zarr.open_group(zarr_path, mode='r+')
-                try:
-                    for var in ds_encoded.data_vars:
-                        if var not in z_store:
-                            print(f"Warning: {var} not in zarr store, skipping")
-                            continue
-                        
-                        data = ds_encoded[var].values                    
-                        # write directly to the zarr array at the specified region
-                        if data.ndim == 2:  # (time, range)
-                            z_store[var][start:stop, :] = data
-                        elif data.ndim == 1:  # (time,)
-                            z_store[var][start:stop] = data
-                        elif data.ndim == 3:  # (time, range, doppler)
-                            z_store[var][start:stop, :, :] = data
-                    
-                    zarr.consolidate_metadata(zarr_path)
-                except Exception as e:
-                    print(f"    ERROR writing to zarr for {radar}: {e}", flush=True)
-                    zarr_ds.close()
-                    continue
-                
-                zarr_ds.close()
-                ts_end = pd.Timestamp.now()
-                print(f"    Wrote {len(overlapping_times)} timesteps for {radar} on {ts_end.strftime('%H:%M:%S (%Y-%m-%d)')}", flush=True)
-                print(f"    (elapsed time for loading & appending data to zarr: {format_elapsed((ts_end - ts_zarr).total_seconds())}", flush=True)
-
+                        spec_var = next(v for v in ds_new.data_vars if 'doppler' in ds_new[v].dims)
+                        if ds_new.sizes['doppler'] != z_store[spec_var].shape[-1]:
+                            raise ValueError("no doppler coordinate in zarr and number of doppler bins differs")
+ 
+                ds_new = ds_new.load()  # compute the processing once
+ 
+                # clip to the defined ranges, as in campaign_to_zarr
+                for var in ds_new.data_vars:
+                    vrange = zarr_variables[radar].get(var, {}).get('range')
+                    if var in encodings[radar] and vrange is not None:
+                        data = ds_new[var].astype(float)
+                        ds_new[var] = data.where(np.isfinite(data)).clip(min=vrange[0], max=vrange[1])
+ 
+                # encode and write each variable in the zarr's own dimension order
+                ds_new = xr.Dataset({v: ds_new[v].transpose(*zarr_dims[v]) for v in ds_new.data_vars})
+                ds_enc = preprocess_for_zarr(ds_new.drop_vars(['range', 'doppler'], errors='ignore'),
+                                             encodings[radar]).compute()
+                for var in ds_enc.data_vars:
+                    z_store[var][start:stop, ...] = ds_enc[var].values
+ 
+                elapsed = (pd.Timestamp.now() - ts).total_seconds()
+                print(f"{t0:%Y-%m-%d %H:%M}: wrote {stop - start} time steps of {list(ds_enc.data_vars)} ({elapsed:.0f} s)", flush=True)
+ 
+            except Exception as e:
+                print(f"{t0:%Y-%m-%d %H:%M}: ERROR {type(e).__name__}: {e}", flush=True)
+ 
+            finally:
+                if ds is not None:
+                    ds.close()
+                del ds, ds_new, ds_enc
+                gc.collect()
+ 
 
 def decode_zarr(ds: xr.Dataset, encodings: Dict[str, Dict]) -> xr.Dataset:
     ds_decoded = ds.copy()
