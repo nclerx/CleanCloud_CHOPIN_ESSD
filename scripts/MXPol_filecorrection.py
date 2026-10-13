@@ -7,12 +7,7 @@ Correct MXPol files
 
 @author: clerx
 """
-#%% imports
-import sys
-project_path = '/home/clerx/scripts/chopin_processing'
-if project_path not in sys.path:
-    sys.path.insert(0, project_path)
-
+#%% imports<
 from src import glob, os, pd, gc, plt, pyart, time, datetime
 from src.constants_input import dirs, base_dir, start_date, end_date
 from src.utils import generate_date_range, check_time

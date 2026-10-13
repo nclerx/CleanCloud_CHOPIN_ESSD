@@ -8,11 +8,6 @@ script to do campaign-wide statistics/plotting using zarr files
 @author: clerx
 """
 # %% imports
-import sys
-project_path = '/home/clerx/scripts/chopin_processing'
-if project_path not in sys.path:
-    sys.path.insert(0, project_path)
-
 from src import os, glob, np, pd, xr, plt, sns, datetime, mcolors, LogNorm, mdates, time, scipy, timedelta
 from src.constants_input import base_dir, dirs, zarr_variables, df_precip, pltConfig, plotdates_weekly, start_date, end_date, DFR_fn, date_ticks, radars, BASTAmodes, radar_ranges, calibrationvalues, frequencies, att_fn
 from src.plotting import plot_density_histogram, plot_density, FuncFormatter, meters_to_km, meters_to_km_num, weekly_plot, plot_weekly_HALO, weekly_plot_paper, weekly_plot_paper_ext, paper_plots

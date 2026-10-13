@@ -2,11 +2,6 @@
 # -*- coding: utf-8 -*-
 """
 """
-import sys
-project_path = '/home/clerx/scripts/chopin_processing'
-if project_path not in sys.path:
-    sys.path.insert(0, project_path)
-
 from src.constants_input import headers, G, R_earth, latlon_Helmos, radar_altitude, temps, MXPol_lost_frequency_times
 from src import glob, os, np, pd, xr, da, re, datetime, timedelta, interp1d
 

@@ -8,11 +8,6 @@ script to create campaign-long zarr files for all radars
 @author: clerx
 """
 #%% imports & constants
-import sys
-project_path = '/home/clerx/scripts/chopin_processing'
-if project_path not in sys.path:
-    sys.path.insert(0, project_path)
-    
 from src import os, pd, xr, zarr, datetime
 from src.constants_input import common_range as range_bins
 from src.constants_input import base_dir, dirs, zarr_variables, att_fn, DFR_fn, BASTAmode, start_date, end_date, radar_ranges, time_bins_radars, BASTAmodes, common_range

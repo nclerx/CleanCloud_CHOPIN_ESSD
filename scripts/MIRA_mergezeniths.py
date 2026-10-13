@@ -13,12 +13,11 @@ import pandas as pd
 import numpy as np
 import dask
 import sys
-sys.path.append('/home/clerx/cleancloud/scripts/github')
 
-from MIRA_auxiliary import *
-from MIRA_plotting import *
+from src import glob, os, dask, np, pd, xr, datetime, timedelta
+from src.utils import generate_date_range
+from src.MIRA_auxiliary import preprocess, preprocess_mmclx, get_files_ranges, get_files_ranges_mmclx, plot_hourly_data
 
-from datetime import datetime, timedelta
 from dask import delayed
 
 

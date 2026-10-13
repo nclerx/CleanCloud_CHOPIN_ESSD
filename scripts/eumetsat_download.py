@@ -2,21 +2,31 @@
 # -*- coding: utf-8 -*-
 """
 Created on Mon Feb 09 10:36:34 2026
-download eumetsat geostationary geotiffs
+download eumetsat geostationary geotiffs (DEM data)
 
 @author: clerx
 """
 
-import os, requests, rasterio
+import os
 from datetime import datetime, timedelta
-from eumdac import DataStore
 
-consumer_key = '4BJ6UoVWi1fP06ou9C9UPr0JC0oa'
-consumer_secret = '_bTz9YzwYYMK0RueYViwnuq96UEa'
+import requests
+import rasterio
+from eumdac import AccessToken, DataStore
 
-credentials = (consumer_key, consumer_secret)
+# EUMETSAT API credentials, see https://api.eumetsat.int/api-key/
+# set them once in your shell (e.g. in ~/.bashrc):
+#   export EUMETSAT_CONSUMER_KEY='...'
+#   export EUMETSAT_CONSUMER_SECRET='...'
+try:
+    credentials = (os.environ['EUMETSAT_CONSUMER_KEY'],
+                   os.environ['EUMETSAT_CONSUMER_SECRET'])
+except KeyError:
+    raise SystemExit('Set EUMETSAT_CONSUMER_KEY and EUMETSAT_CONSUMER_SECRET '
+                     '(see https://api.eumetsat.int/api-key/)')
 
-token = eumdac.AccessToken(credentials)
+token = AccessToken(credentials)
+datastore = DataStore(token)
 
 print(f"This token '{token}' expires {token.expiration}")
 API_KEY = "YOUR_EUMETSAT_API_KEY"  # Your EUMETSAT API key

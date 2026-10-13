@@ -5,15 +5,9 @@ Created on Fri Jun 20 15:03:42 2025
 
 @author: clerx
 """
-import sys
-project_path = '/home/clerx/scripts/chopin_processing'
-if project_path not in sys.path:
-    sys.path.insert(0, project_path)
-
 from numpy.lib.stride_tricks import sliding_window_view
-from functools import partial
 from scipy.stats import linregress
-from scipy.ndimage import minimum_filter, label
+from scipy.ndimage import label
 from src import re, os, glob, pyart, np, pd, xr, da, datetime
 from src.constants_input import radar_altitude, MXPol_Zdr_corrections, cloudtop_params, cloudtop_criteria, scantimes_MXPol
 from src.constants_input import metek_fieldmapping, metek_fieldmetadata, metek_attrmapping, common_range, common_range_spacing

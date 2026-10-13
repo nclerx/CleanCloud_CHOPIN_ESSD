@@ -3,11 +3,6 @@
 """
 Created on Wed 15 Oct 09:30:15 2025
 """
-import sys
-project_path = '/home/clerx/scripts/chopin_processing'
-if project_path not in sys.path:
-    sys.path.insert(0, project_path)
-
 from src import glob, os, np, pd, da, zarr, xr, plt, LogNorm, time, gc
 from src.utils import find_MIRA_files
 from src.constants_input import default_variable_maps, radar_altitude, zarr_variables, doppler_dim_map, doppler_dims, time_bins_radars, ranges

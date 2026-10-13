@@ -10,11 +10,6 @@ and saves output to daily .csv-files
 """
 
 #%% imports
-import sys
-project_path = '/home/clerx/scripts/chopin_processing'
-if project_path not in sys.path:
-    sys.path.insert(0, project_path)
-
 from src import os, glob, np, pd, xr, datetime, timedelta
 from src.constants_input import calibrationvalues, frequencies
 from src.utils import generate_date_range, safe_reindex, read_ERA_data, get_DFRdata

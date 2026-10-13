@@ -9,11 +9,6 @@ based on script https://github.com/ltelab/pyjacopo/blob/main/pyjacopo/example/hy
 @author: clerx
 """
 #%% imports
-import sys
-project_path = '/home/clerx/scripts/chopin_processing'
-if project_path not in sys.path:
-    sys.path.insert(0, project_path)
-
 from src import glob, os, np, pd, xr, gc, plt, pyart, time, datetime, matplotlib as mpl, warnings
 from src.constants_input import dirs, base_dir, start_date, radar_altitude, scantimes_MXPol, MIRA_lapserate
 from src.utils import generate_date_range

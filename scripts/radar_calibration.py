@@ -12,25 +12,10 @@ and Dias Neto et al. 2019 (doi:10.5194/essd-11-845-2019)
 @contributor: mweiss
 """
 #%% imports
-import sys
-project_path = '/home/clerx/scripts/chopin_processing'
-if project_path not in sys.path:
-    sys.path.insert(0, project_path)
-
-import glob
-import os
-
-import numpy as np
-import pandas as pd
-import xarray as xr
-import matplotlib.pyplot as plt
-
-from datetime import datetime
-
+from src import glob, os, np, pd, xr, plt, datetime
 from src.constants_input import base_dir, att_fn, nl, frequencies, all_variables_MXPol, variables_MXPol
 from src.radar_processing import safe_openmfdataset, correct_gas_attenuation, get_clean_mask, calib_stats
 from src.plotting import plot_calibration, plot_calibration_timeline, plot_calibration_quicklook
-
 
 frequency = frequencies['BASTA']
 

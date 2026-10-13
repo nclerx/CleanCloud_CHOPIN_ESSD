@@ -5,38 +5,16 @@ Created on Fri Jun 20 14:58:02 2025
 
 @author: clerx
 """
-import sys
-project_path = '/home/clerx/scripts/chopin_processing'
-if project_path not in sys.path:
-    sys.path.insert(0, project_path)
+from src import os, re, time, pyart, np, pd, xr, sns, gc, matplotlib
 
-import os
-import re
-import time
-import pyart
-import numpy as np
-import pandas as pd
-import xarray as xr
-import dask.array as da
-import seaborn as sns
-import gc
-
-import matplotlib
 matplotlib.use('Agg')
-import matplotlib.pyplot as plt 
-import matplotlib.patches as mpatches
-import matplotlib.gridspec as gridspec
-import matplotlib.colors as mcolors
-import matplotlib.dates as mdates
+from src import plt, mpatches, gridspec, mcolors, mdates
 from matplotlib.lines import Line2D
+
+from src import Path, datetime, cm, FuncFormatter, LogNorm
 
 from pathlib import Path
 from collections import defaultdict
-from datetime import datetime
-from matplotlib import cm
-from matplotlib.ticker import FuncFormatter
-from matplotlib.colors import LogNorm
-from matplotlib.collections import LineCollection, PolyCollection
 
 from src.constants_input import temps, nl, headers, radar_altitude, temps, pltConfig, calibrationvalues, variables_to_plot, variables_type_map, radiosonde_dates, MXPol_lost_frequency_times, variables_peaktree, variables_to_plot_pyart, default_variable_maps
 from src.utils import fit_slope, remove_nans, create_file_with_headers, write_calibrationfile, format_list, flatten_for_densityplot, determine_nbins, determine_nhexbins, mask_to_intervals, mask_to_intervals_numpy, calculate_edges, merge_close_intervals, intervals_to_mask

@@ -32,7 +32,7 @@ project_path = '/home/clerx/scripts/'
 if project_path not in sys.path:
     sys.path.insert(0, project_path)
 
-from MIRA_auxiliary import preprocess_mmclx
+from src.MIRA_auxiliary import preprocess_mmclx
 
 #%% helper functions & constants
 def dtm(s): return datetime.strptime(s, '%Y.%m.%d %H:%M')
@@ -762,17 +762,17 @@ sensitivity_df = pd.DataFrame(all_results)
 sensitivity_df.to_csv(f"{base_dir}/precip_sensitivity.csv", index=False)
 print(sensitivity_df)
 
-# results = []
-# for threshold, gates, mindur, maxgap in itertools.product(vels, gates, min_durations, max_gaps):
-#     res = compute_precip_periods(all_dates, mira_dir, ERA_dir, threshold, gates, mindur, maxgap)
-#     res.update({
-#         'threshold_VEL': threshold,
-#         'min_precip_gates': gates,
-#         'min_duration_min': mindur.total_seconds() / 60,
-#         'max_allowed_gap_min': maxgap.total_seconds() / 60,
-#     })
-#     results.append(res)
-# sensitivity_df = pd.DataFrame(results)
+results = []
+for threshold, gates, mindur, maxgap in itertools.product(vels, gates, min_durations, max_gaps):
+    res = compute_precip_periods(all_dates, mira_dir, ERA_dir, threshold, gates, mindur, maxgap)
+    res.update({
+        'threshold_VEL': threshold,
+        'min_precip_gates': gates,
+        'min_duration_min': mindur.total_seconds() / 60,
+        'max_allowed_gap_min': maxgap.total_seconds() / 60,
+    })
+    results.append(res)
+sensitivity_df = pd.DataFrame(results)
 
 # %% calculate precipitation periods (save to file)
 mira_dir = "/t5500/ltenas7/campaigns/CLEANCLOUD_CHOPIN_2024/MIRA/L1"

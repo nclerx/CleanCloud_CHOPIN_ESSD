@@ -11,22 +11,12 @@ run pamtra to calculate atmospheric attenuation profiles for clear-sky condition
 
 
 #%% imports
-import os 
-import glob
+from src import os, glob, re, warnings, np, pd, plt, FuncFormatter, interp1d
+from src import mdates as md
+
 import pyPamtra 
-import re
-import warnings
-
-import numpy as np
-import pandas as pd
-import matplotlib.pyplot as plt
-import matplotlib.dates as md
 import netCDF4 as nc
-
-from datetime import datetime
 from collections import defaultdict
-from matplotlib.ticker import FuncFormatter
-from scipy.interpolate import interp1d
 
 warnings.filterwarnings('ignore')
 

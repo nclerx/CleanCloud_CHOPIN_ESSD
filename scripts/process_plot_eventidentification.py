@@ -16,11 +16,6 @@ and generates spectrograms (MIRA)
 """
 
 # %% imports
-import sys
-project_path = '/home/clerx/scripts/chopin_processing'
-if project_path not in sys.path:
-    sys.path.insert(0, project_path)
-
 from pathlib import Path
 from matplotlib.dates import HourLocator
 from matplotlib.lines import Line2D
