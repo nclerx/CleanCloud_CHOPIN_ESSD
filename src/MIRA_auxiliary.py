@@ -9,15 +9,29 @@ __all__ = ['meters_to_km', 'find_nearest', 'interpolate_and_smooth',
            'rolling_mean', 'generate_date_range', 'preprocess', 'preprocess_mmclx', 
            'get_files_ranges', 'get_files_ranges_mmclx']
 
-import os
-import glob
-import numpy as np
-import pandas as pd
-import xarray as xr
 import scipy.signal as signal
-
+from src import os, glob, np, pd, xr, datetime, timedelta, dask, matplotlib, mcolors, gridspec, plt, FuncFormatter
 from scipy import ndimage
-from datetime import datetime, timedelta
+
+pltConfig_MIRA = {
+    'Z': {'vmin': -60, 'vmax': 30, 'cmap': matplotlib.colormaps['Spectral_r'], 'label': 'Mie-corrected reflectivity [dBZ]'},
+    'VELg': {'vmin': -8, 'vmax': 5, 'cmap': matplotlib.colormaps['bwr'], 'norm': mcolors.TwoSlopeNorm(vmin=-8, vcenter=0, vmax=5), 'label': 'Mean radial velocity [m s$^{-1}$]'},
+    'RHO': {'vmin': 0, 'vmax': 1, 'cmap': matplotlib.colormaps['Spectral_r'], 'label': r'V-H correlation $\rho_{HV}$'},
+    'LDRg': {'vmin': -35, 'vmax': 5, 'cmap': matplotlib.colormaps['Spectral_r'], 'label': 'Linear depolarization ratio $LDR$ [dB]'},
+    'SKWg': {'vmin': -6, 'vmax': 6, 'cmap': matplotlib.colormaps['Spectral_r'], 'label': 'Skewness [-]'},
+    'DPS': {'vmin': -180, 'vmax': 180, 'cmap': matplotlib.colormaps['Spectral_r'], 'label': r'Differential phase $\Phi_{DP}$ [$^\circ$]'},
+    'RMSg': {'vmin': 0, 'vmax': 3, 'cmap': matplotlib.colormaps['Spectral_r'], 'label': r'Doppler spectrum width [m s$^{-1}$]'},
+    'SNRg': {'vmin': -360, 'vmax': 360, 'cmap': matplotlib.colormaps['Spectral_r'], 'label': 'SNR [dB]'},
+}
+variables = ['elv', 'Z', 'VELg', 'RMSg', 'SKWg', 'SNRg', 'LDRg', 'RHO']
+all_variables = ['nfft', 'prf', 'NyquistVelocity', 'nave', 'ovl', 'zrg', 'rg0',
+ 'drg', 'lambda', 'microsec', 'tpow', 'npw1', 'npw2', 'cpw1', 'cpw2', 'grst',
+ 'azi', 'elv', 'aziv', 'northangle', 'elvv', 'LO_Frequency', 'DetuneFine', 'SNRg',
+ 'VELg', 'RMSg', 'LDRg', 'NPKg', 'SNRcx', 'RHO', 'RHOwav', 'DPS', 'LDRnormal',
+ 'HSDco', 'HSDcx', 'Zg', 'Zcx', 'Z', 'RR', 'LWC', 'Wcorr', 'PIA', 'AttnRain',
+ 'ISDRco', 'ISDRcx', 'Saturatedco', 'Saturatedcx', 'SPCco', 'SPCcx', 'NvD',
+ 'DropSize', 'SPCcocxRe', 'SPCcocxIm', 'MRMco', 'MRMcx', 'RadarConst', 'SNRCorFaCo',
+ 'SNRCorFaCx', 'SKWg']
 
 
 def meters_to_km(y, _):
@@ -230,3 +244,84 @@ def get_files_ranges_mmclx(day, month, year, source):
         data[hour] = {'files': valid_files, 'timeranges': time_ranges}
 
     return data
+
+
+def plot_hourly_data(files, date, date_output_dir):
+    """
+    Opens hourly files and plots them in one daily plot for the specified date.
+    """
+    year, month, day = date.year, date.month, date.day
+    full_time = pd.date_range(start=datetime(year, month, day), end=datetime(year, month, day)+timedelta(hours=23, minutes=59,seconds=59), freq='5s')
+    
+    # this way of identifying which plots to make is not ideal since it doesn't 
+    # overwrite any plots
+    plotvars = [
+        variable for variable in variables 
+        if not os.path.exists(os.path.join(date_output_dir, f"{year}{month:02}{day:02}_{variable}.png"))
+        ]
+    # plotvars = ['elv', 'VELg']
+    
+    with dask.config.set(scheduler='processes'):
+        daily_data = xr.open_mfdataset(files, combine='by_coords', chunks={}, preprocess=preprocess, decode_cf=True, drop_variables=[var for var in all_variables if var not in plotvars], parallel=True)
+        msk = ((daily_data.elv == 90) | (daily_data.elv == -1000.)).compute()   # for period from 2025.01.13 to 2025.01.20 since elevation/motor issue
+        daily_data = daily_data.where(msk, drop=True).mean(dim='doppler')
+        msk.close()
+        
+        if daily_data.time.dtype == 'int32':
+            daily_data = daily_data.assign_coords(time=pd.to_datetime(daily_data['time'].values, unit='s'))
+
+        plotvars.remove('elv')
+        print(f"Plotting variables {plotvars} for {year}-{month:02}-{day:02}.")
+
+        daily_data = daily_data.reindex(time=full_time)  # removed for period from 2025.01.13 to 2025.01.20 since no scans considered i.e. no major time gaps
+
+        for variable in plotvars:
+            output_path = os.path.join(date_output_dir, f"{year}{month:02}{day:02}_{variable}.png")
+            if variable not in daily_data:
+                print(f"Variable '{variable}' not found in daily data.")
+                continue
+   
+            fig = plt.figure(figsize=(32, 8))
+            gs = gridspec.GridSpec(1, 2, width_ratios=[30, 1])
+            
+            ax =  plt.subplot(gs[0])
+            cbar_ax = plt.subplot(gs[1])
+            norm = pltConfig_MIRA[variable].get('norm', mcolors.Normalize(vmin=pltConfig_MIRA[variable]['vmin'], vmax=pltConfig_MIRA[variable]['vmax']))
+            
+            if variable == 'Z':
+                (10*np.log10(daily_data[variable])).plot.imshow(
+                    x='time', y='range',
+                    vmin=pltConfig_MIRA[variable]['vmin'],
+                    vmax=pltConfig_MIRA[variable]['vmax'],
+                    cmap=pltConfig_MIRA[variable]['cmap'],
+                    norm=norm, ax=ax,
+                    cbar_ax=cbar_ax
+                )
+            else:
+                daily_data[variable].plot.imshow(
+                    x='time',
+                    vmin=pltConfig_MIRA[variable]['vmin'],
+                    vmax=pltConfig_MIRA[variable]['vmax'],
+                    cmap=pltConfig_MIRA[variable]['cmap'],
+                    norm=norm, ax=ax,
+                    cbar_ax=cbar_ax
+                )
+    
+            ax.set_xlim([np.datetime64(f"{year}-{month:02d}-{day:02d}T00:00"),
+                         np.datetime64(f"{year}-{month:02d}-{day:02d}T23:59")])
+            ax.set_ylim([0, 12e3])
+    
+            ax.yaxis.set_major_formatter(FuncFormatter(meters_to_km))
+    
+            ax.set_ylabel("Height (km)}")
+            ax.set_xlabel("Time (HH:MM)")
+    
+            title = f"{pltConfig_MIRA[variable]['label']} on {year}-{month:02d}-{day:02d}"
+            ax.set_title(title, fontsize=18, fontweight='bold', pad=20)
+    
+            plt.tight_layout()
+            plt.savefig(output_path)
+            print(f"Saved plot for {variable} on {year}-{month:02}-{day:02}.")
+            plt.close(fig)
+    
+        daily_data.close()

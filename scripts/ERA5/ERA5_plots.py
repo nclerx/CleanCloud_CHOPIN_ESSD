@@ -8,11 +8,6 @@ script to make synoptic ERA plots
 @author: clerx
 """
 # %% imports
-import sys
-project_path = '/home/clerx/scripts/chopin_processing'
-if project_path not in sys.path:
-    sys.path.insert(0, project_path)
-
 from src import os, glob, np, pd, xr, plt, sns, datetime, mcolors, LogNorm, mdates, time, scipy, cartopy, cm, cfeature, rasterio
 from src import crs as ccrs
 from src.constants_input import base_dir, dirs, zarr_variables, df_precip, pltConfig, plotdates_weekly, start_date, end_date, DFR_files, date_ticks, latlon_Helmos, radar_altitude
@@ -36,6 +31,7 @@ from rasterio.windows import from_bounds
 #%% load all ERA data
 start, end = datetime(2025, 1, 1), datetime(2025, 1, 24)
 
+# # load full ERA5 data set
 # ERA = []
 # # for date in pd.date_range(start_date, end_date):
 # print(f"Loading ERA data from {start.strftime('%Y-%m-%d')} to {end.strftime('%Y-%m-%d')}")
