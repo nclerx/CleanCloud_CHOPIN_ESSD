@@ -1,0 +1,17 @@
+[build-system]
+requires = ["setuptools>=64"]
+build-backend = "setuptools.build_meta"
+ 
+[project]
+name = "chopin_processing"
+version = "1.0.0"
+description = "Processing code for the CHOPIN multi-frequency cloud radar dataset (MXPol, MIRA, BASTA)"
+readme = "README.md"
+license = { text = "MIT" }
+authors = [{ name = "Nicole Clerx", email = "nicole.clerx@epfl.ch" }]
+requires-python = ">=3.12"
+# Dependencies are managed via environment.yml / requirements.txt
+ 
+[tool.setuptools]
+packages = ["src"]
+ 
