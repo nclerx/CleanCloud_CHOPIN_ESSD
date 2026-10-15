@@ -10,7 +10,6 @@ All variables are derived from the L1 NetCDF files available on the ACTRIS Cloud
 
 All archives are stored in Zarr format version 2. All times are in UTC. Reflectivities and dual-frequency ratios are given in dB(Z).
 
-
 ## Overview of the archives
 
 | Archive | Contents | Resolution |
@@ -41,6 +40,30 @@ In the resampled archives, all three radars share the same `time` and `range` co
 | `z_30s` / `z_120s` | – | – | `reflectivity_30s` / `reflectivity_120s` |
 | `vel_30s` / `vel_120s` | – | – | `velocity_30s` / `velocity_120s` |
 | `bg_30s` / `bg_120s` | – | – | `background_mask_30s` / `background_mask_120s` |
+
+
+## Storage and precision
+
+To reduce file size, most variables are stored as packed unsigned integers with a scale factor and offset (CF conventions). They are decoded automatically to float64 when the archives are opened with xarray (or any CF-aware reader), so no manual conversion is needed. Packing limits the resolution of the stored values, and values outside the listed range were clipped to the range limits before packing.
+
+| Variable | Resolution | Values clipped to |
+|---|---|---|
+| `reflectivity`, `reflectivity_raw`, `z_30s`, `z_120s` | 0.1 dB | −60 to 45 dBZ |
+| `velocity`, `vel_30s`, `vel_120s` | 0.1 m/s | −10 to 10 m/s <sup>a</sup> |
+| `spectrumwidth` | MIRA: 0.001 m/s; MXPol: 0.01 m/s | MIRA: 0 to 6 m/s; MXPol: 0 to 3 m/s |
+| `skewness` (MIRA) | 0.001 | −2.5 to 2.5 |
+| `LDR` (MIRA) | 0.1 dB | −35 to 5 dB |
+| `rhohv` (MXPol) | 0.01 | 0 to 1 |
+| `snrh`, `snrv`, `snrh_raw`, `snrv_raw` | 0.1 dB | −30 to 70 dB |
+| `sZh`, `sZv`, `sLDR` | 0.01 dB | `sZh`, `sZv`: −45 to 15 dBZ; `sLDR`: −35 to 5 dB |
+| `cloudtop`, `zdi` | 1 m (uint16) | 0 to 15 000 m <sup>b</sup> |
+| `numpeaks` (MIRA) | integer (uint8) | 1 to 10 |
+| `background_mask`, `bg_30s`, `bg_120s` | 0 / 1 (uint8) | – |
+| `is_precip`, `mask_artefacts_*` | bool | – |
+| `DFR_XKa`, `DFR_XW`, `DFR_KaW`, `cloudtopDFRs`, `Zdr` (MXPol) | not packed (float) | not clipped |
+
+<sup>a</sup> Clipping at ±10 m/s affects 0.6 % of the BASTA, 0.03 % of the MXPol and <0.01 % of the MIRA echo gates. BASTA velocities are unfolded in the L1 processing and can therefore exceed the Nyquist velocity of the 25 m and 100 m modes.<br>
+<sup>b</sup> `zdi` = 0 indicates that the 0 °C isotherm is at or below the radar altitude.
 
 
 ## Variables present in all archives
